@@ -3,11 +3,10 @@ node_modules/
 
 # Variables de entorno
 .env
-*.env
-!*.env.example
 
 # Artefactos de build del frontend
 dist/
 
 # Sistema
 .DS_Store
+*.swp

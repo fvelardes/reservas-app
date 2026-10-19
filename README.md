@@ -386,3 +386,335 @@ archivo ejecutable. Nada impide levantarlos en el orden equivocado. Esta
 limitación se resuelve en la semana 4 con Docker Compose, que declara las
 dependencias con depends_on y condition: service_healthy, y levanta todo el
 stack en el orden correcto con un solo comando.
+
+
+
+# Semana 04 
+---
+
+## 1. Red y volumen reproducidos de la semana 3
+
+El `docker-compose.yml` declara la red `reservas-net` y el volumen `reservas-db-data`,
+ambos con `name:` explícito. El `name:` evita que Compose les anteponga el prefijo del
+proyecto (`reservas-app_`): así son **exactamente** la red y el volumen de la semana 3,
+con los datos adentro.
+
+Antes del primer `docker compose up` se eliminaron los contenedores y la red de la
+semana 3:
+
+```bash
+docker rm -f reservas-db reservas-api reservas-frontend
+docker network rm reservas-net
+```
+
+**Por qué se borra la red pero no el volumen.** La red de la semana 3 fue creada a mano
+(`docker network create`), sin la etiqueta de propiedad de Compose. Al encontrarla,
+Compose falla (versiones 2.x: `network reservas-net was found but has incorrect label`)
+o advierte y la reutiliza (versiones nuevas: `a network with name reservas-net exists
+but was not created by compose`). Eliminarla deja la red a cargo de Compose, que la
+recrea como suya. El **volumen** no se toca: contiene los datos, y Compose lo reutiliza
+conservándolos (solo advierte: `volume ... already exists but was not created by
+Docker Compose`).
+
+La base de datos se declara **sin `ports`**: es la capa más interna y solo debe
+alcanzarse desde `reservas-net`. En `docker compose ps` aparece como `3306/tcp` **sin
+flecha** (expuesta en la red, no publicada en el host).
+
+---
+
+## 2. Healthcheck de reservas-db (MySQL)
+
+```yaml
+healthcheck:
+  test:
+    - CMD-SHELL
+    - mysqladmin ping -h 127.0.0.1 -u root -p"$$MYSQL_ROOT_PASSWORD" --silent
+  interval: 5s
+  timeout: 5s
+  retries: 20
+  start_period: 40s
+```
+
+**a) Por qué `$$` y no `$`.** Con un solo `$`, la interpolación la hace **Compose** al
+leer el archivo, y la contraseña queda escrita en texto plano en la línea de comando del
+healthcheck, visible con `docker inspect`. Con `$$`, Compose escribe un `$` literal y la
+variable la expande el intérprete **dentro del contenedor**, al ejecutar el healthcheck.
+La contraseña nunca queda grabada en el comando. (Además, con un solo `$` la variable
+—que existe dentro del contenedor, no a nivel Compose— llega vacía y `mysqladmin` falla
+por contraseña, dejando la base `unhealthy`.)
+
+**b) Por qué `start_period: 40s`.** La primera inicialización del directorio de datos de
+MySQL es lenta (crea el datadir, la base, el usuario, apaga el servidor temporal y
+levanta el definitivo). `start_period` es un período de gracia en el que los fallos no
+cuentan: sin él, el contenedor quedaría marcado `unhealthy` cuando en realidad estaba
+arrancando normalmente.
+
+**c) Por qué `-h 127.0.0.1` y no `-h localhost`.** MySQL inicializa en dos tiempos:
+primero un servidor **temporal** sin red, que solo atiende por *socket*; recién después
+el servidor definitivo, que atiende por TCP. Con `-h localhost` el cliente se conecta por
+socket, el servidor temporal responde y el healthcheck informa `healthy` durante la
+inicialización, cuando la base aún no está disponible para nadie. Con `-h 127.0.0.1` la
+conexión es por TCP, que el temporal no atiende: el ping recién responde con el servidor
+definitivo, cuando la base y el usuario ya existen. `127.0.0.1` se refiere al propio
+contenedor (loopback), porque el healthcheck corre dentro de la base.
+
+*Síntoma de diagnóstico:* si la API registra `ECONNREFUSED` con la base ya en `healthy`,
+el healthcheck está usando `-h localhost`.
+
+---
+
+## 3. Healthcheck de reservas-api (Node) — sin instalar curl
+
+```yaml
+healthcheck:
+  test:
+    - CMD
+    - node
+    - -e
+    - "fetch('http://127.0.0.1:3000/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+```
+
+**Por qué no se instala curl.** Node incluye `fetch` nativo desde la versión 18, así que
+el healthcheck se resuelve con el runtime que ya está en la imagen. Instalar `curl` solo
+para chequear engordaría la imagen y le sumaría superficie de ataque, en contra de la
+lección de tamaño de la semana 2. El script distingue dos fallas: `.then(r.ok?0:1)`
+cubre "la API respondió, pero con error" (exit 1), y `.catch` cubre "no se pudo conectar"
+(exit 1). Solo un 2xx da exit 0.
+
+---
+
+## 4. Healthcheck de reservas-frontend (nginx)
+
+```yaml
+healthcheck:
+  test:
+    - CMD-SHELL
+    - wget -q -O - http://127.0.0.1:8080/healthz || exit 1
+```
+
+Usa `wget`, incluido en BusyBox y ya presente en Alpine (no se instala nada). Chequea
+`/healthz` —una ruta del propio nginx— y **no** `/api/health`: cada healthcheck mide su
+propia capa. Si midiera la API, la salud del frontend dependería de la de la API.
+
+---
+
+## 5. depends_on con condición — los dos casos no son equivalentes
+
+```yaml
+# en reservas-api
+depends_on:
+  reservas-db:
+    condition: service_healthy
+
+# en reservas-frontend
+depends_on:
+  reservas-api:
+    condition: service_healthy
+```
+
+**a) reservas-api → reservas-db.** La API debe **conectarse** a la base, y la primera
+inicialización de MySQL demora. La forma corta (`depends_on: [reservas-db]`) solo espera
+a que el contenedor *arranque*, no a que la base esté *lista*: la API intentaría
+conectarse al servidor temporal (que no atiende TCP) y fallaría con `ECONNREFUSED`. Por
+eso necesita `service_healthy`. La API además reintenta la conexión ~60 s, que es lo
+único que subsistirá en Kubernetes, donde no existe `depends_on`.
+
+**b) reservas-frontend → reservas-api.** Lo que no puede faltar es **algún**
+`depends_on`: sin él, el frontend arranca antes que la API, nginx no resuelve el upstream
+y termina con `host not found in upstream`. A nginx le basta con que el nombre resuelva
+—la forma corta también funcionaría—; se usa `service_healthy` además para que arranque
+con la API ya en funcionamiento, sin respuestas 502 en los primeros segundos.
+
+---
+
+## 6. Validación y arranque
+
+```bash
+docker compose config        # valida y muestra la versión resuelta (siempre antes del up)
+docker compose up --build -d # construye y arranca en orden, esperando cada healthcheck
+docker compose ps            # estado y salud de cada servicio
+docker compose logs -f reservas-api
+```
+
+Los tres servicios alcanzan `Up (healthy)`. El arranque es escalonado (db → api →
+frontend), cada uno espera a que el anterior esté `healthy`. Los logs de la API confirman
+la conexión: `esquema listo`, `datos de demo sembrados`, `escuchando en :3000`.
+
+---
+
+## 7. Ciclo de vida de los datos: down vs down -v
+
+```bash
+docker compose down     # elimina contenedores y red; CONSERVA el volumen
+docker compose up -d
+curl -s localhost:3000/api/reservas   # las reservas anteriores siguen respondiendo
+docker compose down -v  # elimina además el volumen: BORRA los datos
+```
+
+- `docker compose down` elimina lo que el próximo `up` recrea idéntico (contenedores,
+  red). El volumen `reservas-db-data` **sobrevive**: tras `down` + `up`, el `curl`
+  devolvió reservas creadas días atrás, prueba de la persistencia.
+- `docker compose down -v` elimina también el volumen (`Volume reservas-db-data
+  Removed`). Los datos se pierden de forma **irreversible**; sirve para empezar de cero a
+  propósito, y para nada más.
+
+Como MySQL solo inicializa sobre un volumen vacío, tras `down` el `up` no reinicializa (los
+datos están); tras `down -v` el `up` reinicializa desde cero y quedan solo los datos de
+demo que siembra el código.
+
+---
+
+## 8. Variables sensibles: .env, .env.example y .gitignore
+
+- `.env.example` (versionado) documenta el contrato de variables de las tres capas.
+- `.env` (en `.gitignore`) tiene los valores reales y **no** viaja a git.
+- Las dos contraseñas del usuario de la app deben coincidir entre capas
+  (`MYSQL_PASSWORD` de la base = `DB_PASSWORD` de la API); la de root
+  (`MYSQL_ROOT_PASSWORD`) solo la usa la base y su healthcheck.
+
+**Qué sigue siendo un problema en producción.** El `.env` saca la contraseña de **git**,
+pero no del **contenedor**: `docker compose config` y `docker inspect` la siguen mostrando
+en texto plano, y cualquiera con acceso al host la ve. Es higiene de repositorio, no
+gestión de secretos. La solución real llega en la semana 7 con los objetos **Secret**
+(valores sensibles, gestionados aparte) y **ConfigMap** (configuración no sensible) de
+Kubernetes.
+
+---
+
+
+
+
+##9d Escaneo de vulnerabilidades (Trivy)
+
+Escaneo ejecutado como contenedor, sin instalar nada:
+
+    docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy image reservas-api:v1
+    docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy image reservas-frontend:v1
+
+Las vulnerabilidades con parche se contaron con el flag `--ignore-unfixed`.
+
+| Imagen | Origen | Hallazgos totales | Con parche (Fixed Version) |
+|---|---|---|---|
+| `reservas-api:v1` | sistema base (Debian 12.13) | 289 (6 critical, 68 high) | 61 (5 critical) |
+| `reservas-api:v1` | dependencias Node | 40 (2 critical, 22 high) | 39 (2 critical) |
+| `reservas-frontend:v1` | sistema base (Alpine 3.21.3) | 200 (2 critical, 51 high) | 200 (todas) |
+
+**Lectura:**
+- **Frontend (Alpine):** las 200 tienen parche → la base fijada quedó vieja. Se arregla reconstruyendo sobre una imagen base más nueva.
+- **Base de la API (Debian):** solo 61 de 289 tienen parche; las ~228 restantes no tienen corrección disponible hoy. Las 61 accionables (5 critical) se mitigan actualizando la base; el resto se documenta y se decide.
+- **Dependencias Node:** 39 de 40 tienen parche → se corrigen actualizando las librerías de la app (regenerar `package-lock.json`).
+
+## 10. Mínimo privilegio (cap_drop / cap_add)
+
+Se aplicó `cap_drop: [ALL]` a los tres servicios. Las dos imágenes propias
+(`reservas-api`, `reservas-frontend`) siguieron en `healthy`: ya corren como
+usuario no-root (`node` uid 1000 y `nginx` uid 101), no hacen operaciones
+privilegiadas y no necesitan ninguna capability.
+
+`reservas-db` falló al arrancar:
+
+    [ERROR] [MY-010126] [Server] setgid: Operation not permitted
+    [ERROR] [MY-010119] [Server] Aborting
+
+La imagen de MySQL arranca como root para preparar el directorio de datos
+(`/var/lib/mysql`) y luego baja a su propio usuario `mysql`. Ese cambio de
+usuario/grupo y el ajuste de permisos requieren capabilities que `cap_drop: [ALL]`
+había quitado. Se devolvieron solo las necesarias:
+
+    reservas-db:
+      cap_drop: [ALL]
+      cap_add: [CHOWN, SETGID, SETUID, DAC_OVERRIDE, FOWNER]
+
+- CHOWN: cambiar el dueño de archivos del datadir
+- SETGID / SETUID: cambiar de grupo/usuario (bajar de root a mysql) — SETGID es la
+  que el error señalaba
+- DAC_OVERRIDE / FOWNER: ajustar permisos y operar sobre archivos del datadir
+
+Con ese `cap_add`, la base alcanzó `healthy` y la cadena completa volvió a levantar.
+
+**Por qué la base requiere capabilities y las otras dos no:** la base *elige*
+arrancar como root para inicializarse y luego degradar a un usuario sin privilegios;
+ese procedimiento necesita permisos concretos. Las imágenes propias ya son no-root
+desde el arranque, así que no tienen nada que degradar ni ningún permiso privilegiado
+que ejercer.
+
+`privileged: true` no se usa nunca para una aplicación: otorga *todas* las
+capabilities y el host entero, cuando la base solo necesita cinco específicas. El
+principio es el opuesto: sacar todo y devolver únicamente lo justo.
+
+
+
+
+######################
+## 11. Comparación: docker-compose.yml vs los tres `docker run` de la semana 3
+
+En la semana 3, levantar el proyecto requería crear la red y el volumen a mano y
+después ejecutar tres `docker run` largos, en un orden que había que recordar y con
+una espera manual entre la base y la API:
+
+    docker network create reservas-net
+    docker volume create reservas-db-data
+
+    docker run -d --name reservas-db --network reservas-net \
+      -e MYSQL_DATABASE=reservasdb -e MYSQL_USER=reservas_user \
+      -e MYSQL_PASSWORD=reservas_pass -e MYSQL_ROOT_PASSWORD=reservas_root_pass \
+      -v reservas-db-data:/var/lib/mysql mysql:8.4
+    # (esperar a mano el mensaje "ready for connections" con port: 3306)
+    docker run -d --name reservas-api --network reservas-net \
+      -e DB_HOST=reservas-db -e DB_PORT=3306 -e DB_NAME=reservasdb \
+      -e DB_USER=reservas_user -e DB_PASSWORD=reservas_pass \
+      -p 3001:3000 reservas-api:v1
+    docker run -d --name reservas-frontend --network reservas-net \
+      -p 3000:8080 reservas-frontend:v1
+
+Hoy todo eso es un único `docker-compose.yml` versionado y un `docker compose up`.
+
+### Qué desapareció
+
+- **Los comandos manuales.** Cuatro comandos (`network create`, `volume create` y
+  tres `run`) con sus flags se reemplazan por un archivo y un `up`.
+- **El orden en la memoria.** El orden red → volumen → base → API → frontend ya no
+  reside en la cabeza de quien levanta el proyecto: lo declara `depends_on` y lo
+  resuelve Compose.
+- **La espera manual.** Ya no hace falta mirar los logs y esperar el `ready for
+  connections` antes de lanzar la API: los `healthcheck` + `condition:
+  service_healthy` hacen que cada servicio espere a que el anterior esté sano.
+- **Los flags sueltos.** Cada `-e`, `-p`, `-v`, `--network`, `--name` pasa a ser una
+  clave declarada en el archivo.
+
+### Qué apareció
+
+- **Un archivo versionado**, que vive en el repositorio junto al código y es la fuente
+  única de verdad de cómo se levanta el proyecto.
+- **Los healthchecks**: cada servicio declara qué significa estar sano (`mysqladmin
+  ping`, `node fetch`, `wget`). Antes un contenedor solo estaba `Up` o no; no había
+  noción de salud.
+- **`depends_on` con condición**: el orden y la espera, antes implícitos, ahora son
+  declaración explícita.
+- **Un solo comando para todo el ciclo**: `up`, `down`, `logs`, `ps`, `config` operan
+  sobre el proyecto entero.
+
+### Mapa de traducción
+
+| Semana 3 (`docker run`) | Semana 4 (`docker-compose.yml`) |
+|---|---|
+| `--name reservas-db` | nombre del servicio (`reservas-db:`) |
+| `--network reservas-net` | `networks: [reservas-net]` + bloque `networks:` |
+| `-v reservas-db-data:/var/lib/mysql` | `volumes: [...]` + bloque `volumes:` |
+| `-e VAR=valor` | `environment:` |
+| `-p 3001:3000` | `ports: ["3001:3000"]` |
+| el orden en que se tipean los comandos | `depends_on:` + `healthcheck:` |
+
+La última fila es la única que no es una traducción literal: el orden de los comandos
+no era un flag, era **memoria**. Ahora es una declaración, y es la ganancia central de
+esta etapa.
+
+### Hacia adelante
+
+Este archivo es la referencia contra la que se compararán los manifiestos de Kubernetes
+desde la semana 5: cada servicio se vuelve un manifiesto, y `depends_on` desaparece
+(Kubernetes no lo tiene). Por eso la API conserva su reintento de conexión (~60 s), que
+es lo único de la espera que sobrevive al cambio de orquestador.
+########################################
+
+

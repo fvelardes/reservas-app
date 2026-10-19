@@ -1,0 +1,77 @@
+services:
+  reservas-db:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
+      MYSQL_DATABASE: reservasdb
+      MYSQL_USER: reservas_user
+      MYSQL_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - reservas-db-data:/var/lib/mysql
+    networks:
+      - reservas-net
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETGID, SETUID, DAC_OVERRIDE, FOWNER]
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - mysqladmin ping -h 127.0.0.1 -u root -p"$$MYSQL_ROOT_PASSWORD" --silent
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 40s
+
+  reservas-api:
+    build: { context: ./backend }
+    image: reservas-api:v1
+    environment:
+      DB_HOST: reservas-db
+      DB_USER: reservas_user
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_NAME: reservasdb
+    ports:
+      - "3001:3000"
+    networks:
+      - reservas-net
+    depends_on:
+      reservas-db:
+        condition: service_healthy
+    cap_drop: [ALL]
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3000/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  reservas-frontend:
+    build: { context: ./frontend }
+    image: reservas-frontend:v1
+    ports:
+      - "3000:8080"
+    networks:
+      - reservas-net
+    depends_on:
+      reservas-api:
+        condition: service_healthy
+    cap_drop: [ALL]
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - wget -q -O - http://127.0.0.1:8080/healthz || exit 1
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+networks:
+  reservas-net:
+    name: reservas-net
+
+volumes:
+  reservas-db-data:
+    name: reservas-db-data
