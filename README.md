@@ -1,5 +1,168 @@
 # reservas-app
 
+Sistema de reserva de salas por franja horaria. Proyecto integrador del curso *Contenedores, Docker y Orquestación con Kubernetes* (FACET – UNT), **variante B**: React + Vite servido por nginx, API Node 20 + Express y MySQL 8.4.
+
+## Documentos de la entrega final
+
+| Documento | Contenido |
+|---|---|
+| [`ARQUITECTURA.md`](ARQUITECTURA.md) | Por qué el proyecto es como es: las preguntas del curso, la de la variante B, las dificultades con MySQL y lo pendiente para producción |
+| [`INFORME.md`](INFORME.md) | La demostración de que el despliegue funciona, con capturas y registros de comandos (carpeta [`informe/`](informe/)) |
+| Este `README.md` | Cómo levantar el proyecto por los dos caminos y, más abajo, la bitácora de cada semana |
+
+## Artefactos
+
+| Artefacto | Ubicación |
+|---|---|
+| Dockerfile de la API y del frontend | [`backend/Dockerfile`](backend/Dockerfile), [`frontend/Dockerfile`](frontend/Dockerfile) |
+| Compose | [`docker-compose.yml`](docker-compose.yml) |
+| Manifiestos de Kubernetes (los doce objetos, uno por archivo) | [`k8s/`](k8s/) |
+| Chart de Helm | [`reservas-app/`](reservas-app/) |
+| Imágenes publicadas | `docker.io/fvelardes/reservas-api:v1` y `:v2`, `docker.io/fvelardes/reservas-frontend:v1` |
+
+Los doce objetos en `k8s/`:
+
+| Archivo | Objeto |
+|---|---|
+| `deploy-reservas-frontend.yaml` | Deployment `reservas-frontend` |
+| `deploy-reservas-api.yaml` | Deployment `reservas-api` |
+| `deploy-reservas-db.yaml` | Deployment `reservas-db` |
+| `svc-reservas-frontend.yaml` | Service `reservas-frontend` (NodePort 30301) |
+| `svc-reservas-api.yaml` | Service `reservas-api` (ClusterIP) |
+| `svc-reservas-db.yaml` | Service `reservas-db` (ClusterIP) |
+| `cm-reservas-frontend.yaml` | ConfigMap `reservas-frontend-config` |
+| `cm-reservas-api.yaml` | ConfigMap `reservas-api-config` |
+| `secret-reservas-db.example.yaml` | Secret `reservas-db-secret` (plantilla con valores de laboratorio) |
+| `pvc-reservas-db.yaml` | PersistentVolumeClaim `reservas-db-pvc` |
+| `ingress-reservas-app.yaml` | Ingress `reservas-app-ingress` (`reservas.local` → `reservas-frontend:8080`) |
+| `hpa-reservas-api.yaml` | HorizontalPodAutoscaler `reservas-api-hpa` |
+
+El resto de los archivos de `k8s/` son material de las prácticas y no forman parte del proyecto: los Pods sueltos de la semana 5 (`pod-*.yaml`), el Service de depuración de la semana 6 (`svc-reservas-api-nodeport.yaml`) y los dos archivos del error provocado de la semana 7 (`pod-preparar-volumen.yaml`, `deploy-reservas-db-sin-subpath.yaml`).
+
+## Credenciales: valores de laboratorio
+
+**El repositorio no contiene credenciales reales.** Todas las contraseñas que aparecen en él son valores de laboratorio:
+
+- `.env.example` (Compose) y `k8s/secret-reservas-db.example.yaml` (Kubernetes) son plantillas. Los archivos reales, `.env` y `k8s/secret-reservas-db.yaml`, están en `.gitignore`.
+- En el chart, `values.yaml` trae los mismos valores de ejemplo (`cambiar_pass`, `cambiar_root_pass`). Las credenciales reales se pasan con un archivo aparte, `reservas-app/values-secret.yaml`, que también está en `.gitignore`.
+- Las contraseñas que aparecen en la bitácora de las semanas 3 a 6 (`reservas_pass`, `reservas_root_pass`) son las de laboratorio que se usaron en esas prácticas, antes de existir el Secret.
+
+Cómo se gestionarían en un entorno real: `ARQUITECTURA.md`, sección 4, "Gestión externa de secretos".
+
+---
+
+## Cómo levantarlo con Compose (una sola máquina)
+
+Requisitos: Docker con el plugin Compose. Los puertos 3000 y 3001 del host tienen que estar libres.
+
+```bash
+cp .env.example .env
+```
+
+Editar `.env` y definir `DB_ROOT_PASSWORD` y `DB_PASSWORD` (Compose solo lee esas dos; el resto de las líneas de la plantilla documentan los nombres que usa cada imagen). Después:
+
+```bash
+docker compose config --quiet
+docker compose up -d --build --wait
+docker compose ps
+```
+
+Los tres servicios tienen que aparecer `(healthy)`. Arrancan en orden, base → API → frontend, porque cada uno espera la comprobación de estado del anterior.
+
+- Aplicación: http://localhost:3000
+- API directa, solo para depuración: http://localhost:3001/health
+- La base no publica puertos: solo se alcanza desde la red `reservas-net`.
+
+Para detenerlo:
+
+```bash
+docker compose down
+```
+
+`down` conserva el volumen `reservas-db-data` con los datos. `docker compose down -v` lo borra y la próxima vez la base arranca vacía (la API vuelve a sembrar las salas de demo).
+
+## Cómo levantarlo con Helm (clúster Kubernetes)
+
+Requisitos: `kubectl` apuntando al clúster, Helm 3 o superior, `metrics-server` funcionando (para el autoescalador) y un controlador de Ingress con la clase `nginx`.
+
+1. Crear el archivo de credenciales, que no se versiona:
+
+```bash
+cat > reservas-app/values-secret.yaml <<'YAML'
+db:
+  credentials:
+    user: "reservas_user"
+    password: "<contraseña>"
+    rootPassword: "<contraseña de root>"
+YAML
+```
+
+2. Validar el render antes de instalar. Tienen que salir 12 objetos:
+
+```bash
+helm lint reservas-app
+helm template reservas-app ./reservas-app -n reservas-app -f reservas-app/values-secret.yaml | grep -c '^kind:'
+```
+
+3. Instalar la release. Si el namespace tiene objetos con los mismos nombres creados con `kubectl apply` (entregas 5 a 7), hay que borrarlos antes, porque Helm no instala sobre objetos que no le pertenecen:
+
+```bash
+helm install reservas-app ./reservas-app -n reservas-app --create-namespace -f reservas-app/values-secret.yaml --wait --timeout 5m
+kubectl get all,cm,secret,pvc,ingress,hpa -n reservas-app
+```
+
+En la primera instalación, con el volumen vacío, MySQL tarda más de un minuto en inicializarse. Durante ese tiempo la API puede reiniciarse una vez y el Ingress responder `502`; se resuelve solo.
+
+4. Acceder por el Ingress. Agregar al `/etc/hosts` la IP del controlador (en el clúster del curso, `172.16.21.227`):
+
+```bash
+echo "172.16.21.227 reservas.local" | sudo tee -a /etc/hosts
+```
+
+Aplicación: http://reservas.local. También responde por el NodePort del frontend: `http://<IP-del-nodo>:30301`.
+
+5. Actualizar, consultar el historial y revertir. `helm upgrade` **no** conserva los valores de la instalación, así que hay que repetir `-f`:
+
+```bash
+helm upgrade reservas-app ./reservas-app -n reservas-app -f reservas-app/values-secret.yaml --set api.image.tag=v2
+helm history reservas-app -n reservas-app
+helm rollback reservas-app 1 -n reservas-app
+```
+
+Valores principales de `values.yaml`: `api.image.tag`, `frontend.image.tag`, `frontend.replicas`, `api.replicas` (solo con `hpa.enabled=false`), `hpa.minReplicas`, `hpa.maxReplicas`, `hpa.cpuUtilization`, `api.resources`, `ingress.host`, `db.storage`. Tabla completa en la semana 8, consigna 5.
+
+Para desinstalar:
+
+```bash
+helm uninstall reservas-app -n reservas-app
+```
+
+El PVC lo crea el chart, así que `helm uninstall` también lo borra, y con él los datos.
+
+### Alternativa: los manifiestos sueltos
+
+```bash
+kubectl create namespace reservas-app
+cp k8s/secret-reservas-db.example.yaml k8s/secret-reservas-db.yaml
+```
+
+Editar las contraseñas de `k8s/secret-reservas-db.yaml` y aplicar en orden (lo que los Pods referencian primero, la publicación al final):
+
+```bash
+kubectl apply -f k8s/cm-reservas-api.yaml -f k8s/cm-reservas-frontend.yaml -f k8s/secret-reservas-db.yaml
+kubectl apply -f k8s/pvc-reservas-db.yaml
+kubectl apply -f k8s/svc-reservas-db.yaml -f k8s/svc-reservas-api.yaml -f k8s/svc-reservas-frontend.yaml
+kubectl apply -f k8s/deploy-reservas-db.yaml -f k8s/deploy-reservas-api.yaml -f k8s/deploy-reservas-frontend.yaml
+kubectl apply -f k8s/hpa-reservas-api.yaml -f k8s/ingress-reservas-app.yaml
+```
+
+Los dos caminos crean los mismos objetos con los mismos nombres: no se pueden usar a la vez en el mismo namespace.
+
+---
+
+# Bitácora del curso
+
+
 ## Arquitectura
 
     navegador ──► reservas-frontend ──────► reservas-api ──────► reservas-db
