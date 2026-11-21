@@ -14,16 +14,21 @@ spec:
         app: reservas-api
     spec:
       containers:
-        - name: reservas-api   
+        - name: reservas-api
           image: fvelardes/reservas-api:v1
           ports:
             - containerPort: 3000
           env:
-            - name: DB_HOST
-              value: "reservas-db"   
             - name: DB_USER
-              value: "reservas_user"
+              valueFrom:
+                secretKeyRef:
+                  name: reservas-db-secret
+                  key: MYSQL_USER
             - name: DB_PASSWORD
-              value: "reservas_pass"
-            - name: DB_NAME
-              value: "reservasdb"
+              valueFrom:
+                secretKeyRef:
+                  name: reservas-db-secret
+                  key: MYSQL_PASSWORD
+          envFrom:
+            - configMapRef:
+                name: reservas-api-config

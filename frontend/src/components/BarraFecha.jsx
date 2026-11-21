@@ -4,8 +4,6 @@ const MESES = [
   "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre",
 ];
 
-// Se formatea a mano a partir del string YYYY-MM-DD: pasarlo por new Date()
-// lo interpretaría como UTC y mostraría el día anterior según la zona horaria.
 function enLetras(iso) {
   const [anio, mes, dia] = iso.split("-").map(Number);
   const fecha = new Date(anio, mes - 1, dia);

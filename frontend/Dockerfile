@@ -1,4 +1,3 @@
-# ---- Etapa 1 
 FROM node:20-alpine AS build
 WORKDIR /app
 COPY package.json package-lock.json ./
@@ -6,7 +5,6 @@ RUN npm ci
 COPY . .
 RUN npm run build
 
-# ---- Etapa 2
 FROM nginxinc/nginx-unprivileged:1.27-alpine
 
 ARG APP_VERSION=v1

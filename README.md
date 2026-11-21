@@ -1730,3 +1730,455 @@ Cadena causal: **etcd lento** (incluso en lecturas triviales, 120–750 ms contr
 | `ENOTFOUND reservas-db` (semana 5) | el nombre no existe: no hay Service |
 | `EHOSTUNREACH 10.244.0.7` (semana 5) | IP de un Pod que ya no existe |
 | `ECONNREFUSED 10.109.153.97` (esta semana) | el Service resuelve, pero no tenía endpoints (controller-manager caído): kube-proxy rechaza |
+
+########################################
+
+# Semana 07 — ConfigMaps, Secret, PVC e Ingress
+
+La semana 6 dejó tres Deployments y cuatro Services funcionando, pero con dos deudas explícitas: **toda la configuración y las contraseñas escritas en texto plano dentro de los manifiestos** y **una base de datos sin persistencia** (consigna 9). En esta etapa la configuración pasa a **ConfigMaps**, las credenciales a un **Secret**, el datadir de MySQL a un **PersistentVolumeClaim**, y la aplicación se publica con un nombre de host a través de un **Ingress**.
+
+Regla de trabajo de la semana: **ningún valor de configuración queda literal en un manifiesto de Deployment.**
+
+IPs de referencia: nodo `172.16.21.22`; `EXTERNAL-IP` del Service `nginx-ingress-controller` (IP-LB) `172.16.21.227`.
+
+---
+
+## Consigna 1 — ConfigMap de la API: `reservas-api-config`
+
+```yaml
+data:
+  DB_HOST: "reservas-db"
+  DB_PORT: "3306"
+  DB_NAME: "reservasdb"
+  PORT: "3000"
+  SEED_DEMO: "true"
+```
+
+- **Valores numéricos y booleanos entre comillas:** todo valor de un ConfigMap es una cadena. Sin comillas, YAML interpreta `3306` como entero y `true` como booleano, y el `apply` se rechaza.
+- **`APP_VERSION` no se incluye:** la fija la imagen al construirse (`ARG`/`ENV` del Dockerfile, semana 2). Definirla aquí la sobrescribiría, y el badge mostraría la versión del ConfigMap y no la de la imagen que realmente corre.
+
+```
+$ kubectl get cm,secret -n reservas-app
+NAME                                 DATA   AGE
+configmap/kube-root-ca.crt           1      28d
+configmap/reservas-api-config        5      0s
+configmap/reservas-frontend-config   2      0s
+
+NAME                        TYPE     DATA   AGE
+secret/reservas-db-secret   Opaque   3      0s
+```
+
+`kube-root-ca.crt` lo crea Kubernetes en cada namespace; no es del proyecto.
+
+---
+
+## Consigna 2 — ConfigMap del frontend: `reservas-frontend-config`
+
+```yaml
+data:
+  API_HOST: "reservas-api"
+  API_PORT: "3000"
+```
+
+Son solo dos valores, y hasta la semana 6 venían horneados en la imagen (`ENV` del Dockerfile). El ConfigMap existe igual por la regla de la semana: ningún valor de configuración queda literal en un manifiesto ni escondido en la imagen.
+
+Estos valores **no los lee el JavaScript** (que corre en el navegador y usa rutas relativas `/api/...`): los lee `envsubst` al arrancar nginx, que genera `default.conf` a partir de `default.conf.template` (`proxy_pass http://${API_HOST}:${API_PORT}/`). `NGINX_ENVSUBST_FILTER=^API_` limita la sustitución a esas variables.
+
+```
+$ kubectl describe cm reservas-frontend-config -n reservas-app
+Data
+====
+API_HOST:
+----
+reservas-api
+
+API_PORT:
+----
+3000
+```
+
+---
+
+## Consigna 3 — Secret: `reservas-db-secret`
+
+Tres claves, con los nombres que espera la imagen oficial de MySQL: `MYSQL_USER`, `MYSQL_PASSWORD` y `MYSQL_ROOT_PASSWORD`.
+
+```
+$ kubectl describe secret reservas-db-secret -n reservas-app
+Type:  Opaque
+
+Data
+====
+MYSQL_PASSWORD:       20 bytes
+MYSQL_ROOT_PASSWORD:  21 bytes
+MYSQL_USER:           13 bytes
+```
+
+`describe` muestra solo el tamaño de cada valor. Pero cualquiera con permiso de lectura sobre Secrets obtiene el valor en texto plano con un solo comando:
+
+```
+$ kubectl get secret reservas-db-secret -n reservas-app -o jsonpath='{.data.MYSQL_PASSWORD}' | base64 -d; echo
+rsv_************ (contraseña real, tapada para el repositorio)
+```
+
+> **Un Secret está en base64, que es codificación y no cifrado.** Para protegerlo de verdad hace falta cifrado en reposo en etcd (`EncryptionConfiguration` del API server) o un gestor de secretos externo (por ejemplo Vault o External Secrets), además de **RBAC** que restrinja quién puede leer Secrets en el namespace.
+
+### Qué se versiona y qué no
+
+| Archivo | En git | Contenido |
+|---|---|---|
+| `k8s/secret-reservas-db.yaml` | **no** (está en `.gitignore`) | el Secret real, con las contraseñas |
+| `k8s/secret-reservas-db.example.yaml` | sí | plantilla con valores `cambiar_*` y el comando `kubectl create secret generic` equivalente |
+
+Las contraseñas **se cambiaron** respecto de la semana 6: las anteriores estaban escritas en los manifiestos y en este README, y quedaron en el historial de git (commit `462a01e`). Sacarlas del archivo no las borra del historial; la única medida efectiva es considerarlas comprometidas y reemplazarlas.
+
+---
+
+## Consigna 4 — Refactor de los tres Deployments
+
+| Deployment | Desde el ConfigMap | Desde el Secret |
+|---|---|---|
+| `reservas-db` | `MYSQL_DATABASE` con `configMapKeyRef` → `reservas-api-config` / `DB_NAME` | `envFrom.secretRef`: el Secret entero (`MYSQL_USER`, `MYSQL_PASSWORD`, `MYSQL_ROOT_PASSWORD`) |
+| `reservas-api` | `envFrom.configMapRef`: `reservas-api-config` entero | `DB_USER` y `DB_PASSWORD` con `valueFrom.secretKeyRef`, desde `MYSQL_USER` y `MYSQL_PASSWORD`; **no recibe la root** |
+| `reservas-frontend` | `envFrom.configMapRef`: `reservas-frontend-config` entero | — |
+
+### Un Secret, dos nombres para la misma credencial
+
+MySQL espera `MYSQL_USER` / `MYSQL_PASSWORD`; la API espera `DB_USER` / `DB_PASSWORD`. Es la misma credencial vista desde los dos extremos de la conexión. Tener dos Secrets con los mismos valores crearía dos fuentes de verdad que pueden divergir (y la API dejaría de conectarse sin que nada lo avise). Por eso hay **un solo Secret** con los nombres de MySQL:
+
+- la base lo consume **entero** con `envFrom`, porque sus claves ya tienen los nombres correctos;
+- la API toma **solo las dos claves que necesita** y las **renombra** con `valueFrom.secretKeyRef`:
+
+```yaml
+env:
+  - name: DB_USER                      # como la espera la API
+    valueFrom:
+      secretKeyRef:
+        name: reservas-db-secret
+        key: MYSQL_USER                # como está almacenada
+```
+
+Con `envFrom` la API habría recibido también `MYSQL_ROOT_PASSWORD`, que no necesita: elegir clave por clave es mínimo privilegio. Por la misma razón, `MYSQL_DATABASE` de la base sale de `DB_NAME` del ConfigMap de la API: un solo lugar define el nombre de la base.
+
+El Deployment de la base se aplicó en la consigna 5, junto con el volumen; aquí se aplicaron la API y el frontend:
+
+```bash
+kubectl apply -f k8s/deploy-reservas-api.yaml -f k8s/deploy-reservas-frontend.yaml
+kubectl rollout restart deployment/reservas-api -n reservas-app
+```
+
+La API quedó con **2 réplicas**, como dice su manifiesto: las 3 de la semana 6 eran de la prueba de concurrencia (`kubectl scale`, consigna 8), un cambio imperativo que el archivo nunca reflejó.
+
+### Verificación
+
+```
+$ kubectl exec deploy/reservas-api -n reservas-app -- env | grep -E '^DB_(HOST|PORT|NAME|USER)='
+DB_HOST=reservas-db
+DB_NAME=reservasdb
+DB_PORT=3306
+DB_USER=reservas_user
+
+$ kubectl exec deploy/reservas-frontend -n reservas-app -- env | grep API_
+API_HOST=reservas-api
+API_PORT=3000
+NGINX_ENVSUBST_FILTER=^API_
+RESERVAS_API_SERVICE_HOST=10.102.62.218
+RESERVAS_API_SERVICE_PORT=3000
+...
+```
+
+Las variables `RESERVAS_API_*` no son del proyecto: el kubelet inyecta en cada contenedor las direcciones de los Services que existían en el namespace cuando se creó el Pod (un mecanismo previo al DNS del clúster).
+
+Ningún Deployment tiene ya valores literales:
+
+```
+$ grep -n "value:" k8s/deploy-reservas-*.yaml; echo "exit=$?"
+exit=1
+```
+
+`exit=1` es el código de `grep` cuando no encuentra coincidencias: todo valor sale de `valueFrom` o `envFrom`.
+
+```
+$ curl -s http://172.16.21.22:30301/api/health
+<html>
+<head><title>502 Bad Gateway</title></head>
+...
+
+$ curl -s http://172.16.21.22:30301/api/health     # 25 s después
+{"status":"ok","db":"ok","version":"v1"}
+```
+
+El primer `502` fue **transitorio**: el rollout de la API todavía estaba terminando los tres Pods viejos (`Terminating`), y nginx recibió una conexión hacia uno que ya no atendía. Es el mismo fenómeno de la consigna 6 de la semana 6 (sin *readinessProbe* ni manejo de `SIGTERM`). Terminado el rollout, la aplicación respondió normalmente con la configuración nueva.
+
+---
+
+## Consigna 5 — PersistentVolumeClaim para la base
+
+```yaml
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
+```
+
+- **1Gi**, **RWO** (`ReadWriteOnce`: lo monta un solo nodo a la vez). Junto con `replicas: 1` y `strategy: Recreate` del Deployment, garantiza que nunca haya dos MySQL escribiendo el mismo datadir.
+- **Sin `storageClassName`**: usa la clase por defecto del clúster, `local-path`.
+
+### Pending → Bound
+
+```
+$ kubectl get pvc -n reservas-app            # recién creado
+NAME              STATUS    VOLUME   CAPACITY   ACCESS MODES   STORAGECLASS
+reservas-db-pvc   Pending                                      local-path
+
+$ kubectl get pvc,pv -n reservas-app         # con un Pod que lo usa
+persistentvolumeclaim/reservas-db-pvc   Bound    pvc-2da70d89-...   1Gi   RWO   local-path
+persistentvolume/pvc-2da70d89-...       1Gi   RWO   Delete   Bound   reservas-app/reservas-db-pvc   local-path
+```
+
+`Pending` no es un error: `local-path` tiene `volumeBindingMode: WaitForFirstConsumer`. Como el volumen es un directorio de un nodo concreto, el aprovisionador espera a que el scheduler ubique el primer Pod que lo usa para crear el PV en ese mismo nodo. El PV lo creó el aprovisionador de forma dinámica (nadie escribió un manifiesto de PV) y con `RECLAIM POLICY Delete`: si se borra el PVC, se borran los datos.
+
+### Error provocado: datadir con archivos
+
+Antes de que lo usara MySQL, un Pod descartable (`k8s/pod-preparar-volumen.yaml`, `busybox`) dejó un archivo en la raíz del volumen:
+
+```
+$ kubectl logs preparar-volumen -n reservas-app
+total 12
+drwxrwxrwx    2 root     root          4096 Nov 20 02:07 .
+drwxr-xr-x    1 root     root          4096 Nov 20 02:07 ..
+-rw-r--r--    1 root     root             7 Nov 20 02:07 viejo.txt
+```
+
+Después se aplicó `k8s/deploy-reservas-db-sin-subpath.yaml`, que monta el volumen entero en `/var/lib/mysql`:
+
+```
+$ kubectl get pods -l app=reservas-db
+NAME                           READY   STATUS   RESTARTS      AGE
+reservas-db-686794c888-hclp2   0/1     Error    3 (44s ago)   63s
+
+$ kubectl logs deploy/reservas-db --tail=30
+[Note] [Entrypoint]: Initializing database files
+[ERROR] [MY-010457] [Server] --initialize specified but the data directory has files in it. Aborting.
+[ERROR] [MY-013236] [Server] The designated data directory /var/lib/mysql/ is unusable. You can remove all files that the server added to it.
+[ERROR] [MY-010119] [Server] Aborting
+```
+
+El entrypoint de MySQL ve que el datadir no tiene una base inicializada y ejecuta `mysqld --initialize`, que **solo acepta un directorio vacío**. La raíz del volumen tenía `viejo.txt`, así que aborta; el kubelet reinicia el contenedor y el Pod alterna entre `Error` y `CrashLoopBackOff`. En un caso real el "archivo extraño" suele ser `lost+found`, que crean muchos sistemas de archivos en la raíz de cada volumen.
+
+### Solución: `subPath`
+
+```yaml
+volumeMounts:
+  - name: datos
+    mountPath: /var/lib/mysql
+    subPath: mysql
+```
+
+Con `subPath`, MySQL no ve la raíz del volumen sino el subdirectorio `mysql/`, que el kubelet crea vacío. `viejo.txt` sigue en la raíz, pero MySQL no lo ve.
+
+```
+$ kubectl logs deploy/reservas-db | grep 'ready for connections'
+... /usr/sbin/mysqld: ready for connections. ... port: 0  MySQL Community Server - GPL.
+... /usr/sbin/mysqld: ready for connections. ... port: 3306  MySQL Community Server - GPL.
+
+$ kubectl get pvc,pv -n reservas-app
+persistentvolumeclaim/reservas-db-pvc   Bound    pvc-2da70d89-56e4-48d1-9e16-5a67f2f70d82   1Gi   RWO   local-path
+persistentvolume/pvc-2da70d89-56e4-48d1-9e16-5a67f2f70d82   1Gi   RWO   Delete   Bound   reservas-app/reservas-db-pvc   local-path
+```
+
+La primera línea (`port: 0`) es el servidor temporal con el que el entrypoint crea usuarios y la base; la segunda (`port: 3306`), el servidor definitivo.
+
+---
+
+## Consigna 6 — Persistencia: la reserva sobrevive al Pod
+
+Se creó una reserva por el NodePort:
+
+```
+$ curl -s -X POST http://172.16.21.22:30301/api/reservas -H 'Content-Type: application/json' \
+    -d '{"sala_id":1,"fecha":"2026-12-15","franja":2,"responsable":"Facundo (prueba persistencia TP7)","motivo":"semana 7"}'
+{"id":7,"sala_id":1,"sala":"Laboratorio 1","fecha":"2026-12-15","franja":2,"responsable":"Facundo (prueba persistencia TP7)","motivo":"semana 7","creada_en":"2026-11-20 02:11:22"}
+```
+
+Se borró el Pod de la base y el Deployment lo recreó:
+
+```
+$ kubectl delete pod -l app=reservas-db -n reservas-app
+pod "reservas-db-6fc6f5bcd4-9hpbt" deleted from reservas-app namespace
+
+$ kubectl get pods -l app=reservas-db -o wide
+NAME                           READY   STATUS    RESTARTS   AGE   IP
+reservas-db-6fc6f5bcd4-f85v6   1/1     Running   0          31s   10.244.0.94
+```
+
+Otro Pod (`9hpbt` → `f85v6`), otra IP (`.89` → `.94`), y la reserva sigue ahí:
+
+```
+$ curl -s http://172.16.21.22:30301/api/reservas
+[{"id":1,...},{"id":3,...},{"id":5,...},
+ {"id":7,"sala_id":1,"sala":"Laboratorio 1","fecha":"2026-12-15","franja":2,"responsable":"Facundo (prueba persistencia TP7)","motivo":"semana 7","creada_en":"2026-11-20 02:11:22"}]
+```
+
+La prueba se hizo **dos veces**. En la segunda se observó el reemplazo con `kubectl get pods -w`:
+
+```
+reservas-db-6fc6f5bcd4-f85v6        1/1     Terminating         0          41s
+reservas-db-6fc6f5bcd4-rq8st        0/1     Pending             0          0s
+reservas-db-6fc6f5bcd4-rq8st        0/1     ContainerCreating   0          0s
+reservas-db-6fc6f5bcd4-rq8st        1/1     Running             0          2s
+reservas-db-6fc6f5bcd4-f85v6        0/1     Completed           0          47s
+```
+
+y la reserva `id 7` volvió a aparecer en `/api/reservas`, con `/api/health` en `ok`. Además, MySQL pasó a `ready for connections ... port: 3306` sin el servidor temporal (`port: 0`): encontró un datadir ya inicializado y no tuvo que crear nada.
+
+Desde el navegador, por el Ingress (`http://reservas.local`, día 15/12/2026), se creó una segunda reserva en Laboratorio 1, bloque 3 (responsable "Facundo", motivo "Clase TP7"). La grilla muestra las dos: la `id 7`, creada con `curl` y que ya había sobrevivido a dos recreaciones del Pod de la base, y la nueva. El indicador **API v1** confirma que la página habla con la API a través del proxy del frontend:
+
+![Grilla del 15/12/2026 en reservas.local con las dos reservas](docs/capturas/semana07-reserva-navegador.png)
+
+> **Limitación de la semana 6: resuelta.** En la consigna 9 de la semana 6, borrar el Pod de la base perdía todo, hasta las tablas, porque el datadir vivía en la **capa escribible del contenedor**, que se descarta junto con el Pod. Ahora `/var/lib/mysql` es el subdirectorio `mysql/` de un **PersistentVolume**, cuyo ciclo de vida está atado al PVC y no al Pod: el Deployment repone el proceso y el proceso nuevo encuentra los mismos datos. Es el equivalente del volumen `reservas-db-data` de Compose.
+
+---
+
+## Consigna 7 — Ingress: `reservas-app-ingress`
+
+```yaml
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: reservas.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: reservas-frontend
+                port:
+                  number: 8080
+```
+
+```
+$ kubectl get ingress -n reservas-app
+NAME                   CLASS   HOSTS            ADDRESS         PORTS   AGE
+reservas-app-ingress   nginx   reservas.local   172.16.21.227   80      5s
+
+$ kubectl describe ingress reservas-app-ingress -n reservas-app
+Rules:
+  Host            Path  Backends
+  ----            ----  --------
+  reservas.local
+                  /   reservas-frontend:8080 (10.244.0.90:8080,10.244.0.92:8080)
+Events:
+  Normal  AddedOrUpdated  5s  nginx-ingress-controller  Configuration for reservas-app/reservas-app-ingress was added or updated
+```
+
+`ADDRESS 172.16.21.227` es la `EXTERNAL-IP` del Service `nginx-ingress-controller` (el balanceador que expone al controlador), **distinta de la IP del nodo** `172.16.21.22`. El Ingress no abre ningún puerto por sí mismo: es una regla que el controlador lee y traduce a su propia configuración de nginx.
+
+Para usar el nombre desde el navegador, entrada en `/etc/hosts`:
+
+```
+172.16.21.227 reservas.local
+```
+
+### Por qué una sola regla y no `/api`
+
+El nginx del frontend **ya hace `proxy_pass` a `reservas-api:3000`** para todo `/api/`. Agregar una regla `/api → reservas-api` en el Ingress:
+
+- crearía **dos fuentes de verdad** para el mismo enrutamiento (y dos lugares donde decidir si se quita o no el prefijo `/api`);
+- **expondría la API** directamente hacia afuera, salteando al frontend, que debe ser el único punto de entrada;
+- rompería la **paridad con Compose**, donde no hay Ingress y el enrutamiento de `/api` lo resuelve el mismo nginx del frontend.
+
+### Verificación
+
+```
+$ curl -s -o /dev/null -w '%{http_code} %{content_type}\n' \
+    --resolve reservas.local:80:172.16.21.227 http://reservas.local/api/reservas
+200 application/json; charset=utf-8
+
+$ curl -s -o /dev/null -w '%{http_code} %{content_type}\n' \
+    --resolve reservas.local:80:172.16.21.227 http://reservas.local/reservas
+200 text/html
+
+$ curl -s --resolve reservas.local:80:172.16.21.227 http://reservas.local/reservas | head -6
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>reservas-app</title>
+
+$ curl -s -o /dev/null -w '%{http_code}\n' http://172.16.21.227/api/reservas
+404
+```
+
+| Pedido | Respuesta | Lectura |
+|---|---|---|
+| `reservas.local/api/reservas` | `200 application/json` | **verificación válida**: Ingress → frontend → `proxy_pass` → API → base |
+| `reservas.local/reservas` | `200 text/html` (`index.html`) | **falso positivo**: el `try_files ... /index.html` de la SPA devuelve la página para cualquier ruta desconocida; un `200` no prueba nada sin mirar el `Content-Type` |
+| `172.16.21.227/api/reservas` (sin `Host`) | `404` | lo responde el **controlador**: sin `Host: reservas.local` ninguna regla coincide y el pedido nunca llega al frontend |
+
+`--resolve` reemplaza la entrada de `/etc/hosts` en `curl`: manda el pedido a `172.16.21.227` con el encabezado `Host: reservas.local`, que es lo que el controlador usa para elegir la regla.
+
+---
+
+## Consigna 8 — Inventario de objetos (11 de 12)
+
+| Nombre | Tipo | Función |
+|---|---|---|
+| `reservas-db` | Deployment | Mantiene 1 Pod de MySQL 8.4 (`Recreate`), con datadir en el PVC. |
+| `reservas-api` | Deployment | Mantiene 2 réplicas de la API Node/Express, sin estado. |
+| `reservas-frontend` | Deployment | Mantiene 2 réplicas de nginx: sirve la SPA y hace proxy de `/api`. |
+| `reservas-db` | Service ClusterIP (3306) | Nombre DNS estable de la base; solo accesible dentro del clúster. |
+| `reservas-api` | Service ClusterIP (3000) | Nombre DNS estable de la API para el `proxy_pass` del frontend. |
+| `reservas-frontend` | Service NodePort (30301 → 8080) | Expone el frontend en el nodo y es el backend del Ingress. |
+| `reservas-api-config` | ConfigMap | Configuración no sensible de la API (y `DB_NAME` para la base). |
+| `reservas-frontend-config` | ConfigMap | Upstream de nginx (`API_HOST`, `API_PORT`) para `envsubst`. |
+| `reservas-db-secret` | Secret | Usuario y contraseñas de MySQL, compartidos por la base y la API. |
+| `reservas-db-pvc` | PersistentVolumeClaim | Pide 1Gi RWO para que el datadir sobreviva a los Pods. |
+| `reservas-app-ingress` | Ingress | Publica `reservas.local` → `reservas-frontend:8080` por el controlador nginx. |
+
+> `reservas-api-nodeport` (NodePort `30501`) sigue aplicado como **recurso de depuración de la semana 6**, pero no cuenta entre los 11 y **no irá en el chart de la semana 8**. El objeto 12 será el HPA `reservas-api-hpa`.
+
+---
+
+## Archivos nuevos o modificados en `k8s/`
+
+| Archivo | Estado | Contenido |
+|---|---|---|
+| `cm-reservas-api.yaml` | nuevo | ConfigMap `reservas-api-config` |
+| `cm-reservas-frontend.yaml` | nuevo | ConfigMap `reservas-frontend-config` |
+| `secret-reservas-db.example.yaml` | nuevo | plantilla versionable del Secret |
+| `secret-reservas-db.yaml` | nuevo, **no versionado** | Secret real (en `.gitignore`) |
+| `pvc-reservas-db.yaml` | nuevo | PVC `reservas-db-pvc` |
+| `ingress-reservas-app.yaml` | nuevo | Ingress `reservas-app-ingress` |
+| `pod-preparar-volumen.yaml` | nuevo, solo consigna 5 | Pod que deja `viejo.txt` en la raíz del volumen |
+| `deploy-reservas-db-sin-subpath.yaml` | nuevo, solo consigna 5 | variante sin `subPath` que provoca el error |
+| `deploy-reservas-db.yaml` | modificado | `envFrom` del Secret, `MYSQL_DATABASE` desde ConfigMap, volumen con `subPath` |
+| `deploy-reservas-api.yaml` | modificado | `envFrom` del ConfigMap, `DB_USER`/`DB_PASSWORD` desde el Secret |
+| `deploy-reservas-frontend.yaml` | modificado | `envFrom` del ConfigMap |
+
+### Cómo aplicar todo, en orden
+
+Primero lo que los Pods referencian (un Pod que referencia un ConfigMap o Secret inexistente queda en `CreateContainerConfigError`), después el volumen, los nombres DNS, los Deployments y por último la publicación:
+
+```bash
+# 1. ConfigMaps y Secret (el Secret real se crea a partir de la plantilla)
+kubectl apply -f k8s/cm-reservas-api.yaml -f k8s/cm-reservas-frontend.yaml
+kubectl apply -f k8s/secret-reservas-db.yaml
+
+# 2. PVC
+kubectl apply -f k8s/pvc-reservas-db.yaml
+
+# 3. Services
+kubectl apply -f k8s/svc-reservas-db.yaml -f k8s/svc-reservas-api.yaml -f k8s/svc-reservas-frontend.yaml
+
+# 4. Deployments
+kubectl apply -f k8s/deploy-reservas-db.yaml
+kubectl apply -f k8s/deploy-reservas-api.yaml
+kubectl apply -f k8s/deploy-reservas-frontend.yaml
+
+# 5. Ingress
+kubectl apply -f k8s/ingress-reservas-app.yaml
+```

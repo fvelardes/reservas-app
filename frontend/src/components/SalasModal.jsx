@@ -41,8 +41,6 @@ export default function SalasModal({ salas, onCambio, onCerrar }) {
       await borrarSala(sala.id);
       await onCambio();
     } catch (err) {
-      // El 409 de acá lo genera la foreign key con ON DELETE RESTRICT: la
-      // base se niega a dejar reservas apuntando a una sala que no existe.
       setError(err.message);
     }
   };

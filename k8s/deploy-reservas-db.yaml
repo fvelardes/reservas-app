@@ -4,28 +4,36 @@ metadata:
   name: reservas-db
   namespace: reservas-app
 spec:
-  replicas: 1                
+  replicas: 1
   strategy:
-    type: Recreate           
+    type: Recreate
   selector:
     matchLabels:
       app: reservas-db
-  template:                  
+  template:
     metadata:
       labels:
-        app: reservas-db     
+        app: reservas-db
     spec:
       containers:
         - name: reservas-db
           image: mysql:8.4
           ports:
             - containerPort: 3306
+          envFrom:
+            - secretRef:
+                name: reservas-db-secret
           env:
-            - name: MYSQL_ROOT_PASSWORD
-              value: "reservas_root_pass"
             - name: MYSQL_DATABASE
-              value: "reservasdb"
-            - name: MYSQL_USER
-              value: "reservas_user"
-            - name: MYSQL_PASSWORD
-              value: "reservas_pass"
+              valueFrom:
+                configMapKeyRef:
+                  name: reservas-api-config
+                  key: DB_NAME
+          volumeMounts:
+            - name: datos
+              mountPath: /var/lib/mysql
+              subPath: mysql
+      volumes:
+        - name: datos
+          persistentVolumeClaim:
+            claimName: reservas-db-pvc

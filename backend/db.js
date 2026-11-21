@@ -6,8 +6,6 @@ const ts = () => new Date().toISOString();
 const log = (msg) => console.log(`[${ts()}] ${msg}`);
 const logError = (msg) => console.error(`[${ts()}] ${msg}`);
 
-// Bloques horarios. Viven en la API (no en el frontend) para que la grilla y
-// la validación usen exactamente la misma fuente: el SPA pide /franjas.
 const FRANJAS = [
   { numero: 1, desde: '08:00', hasta: '10:00' },
   { numero: 2, desde: '10:00', hasta: '12:00' },
@@ -33,9 +31,6 @@ const pool = mysql.createPool({
   password: process.env.DB_PASSWORD,
   waitForConnections: true,
   connectionLimit: Number(process.env.DB_POOL_SIZE || 10),
-  // dateStrings evita que mysql2 convierta un DATE a un Date de JavaScript:
-  // esa conversión aplica la zona horaria del proceso y termina corriendo la
-  // fecha un día cuando el contenedor corre en UTC. Ver README.
   dateStrings: true,
 });
 
@@ -47,10 +42,6 @@ const ESQUEMA = [
      ubicacion VARCHAR(120) NOT NULL DEFAULT '',
      CONSTRAINT sala_nombre_unico UNIQUE (nombre)
    )`,
-  // La restricción sin_solapamiento es el corazón de esta variante: es lo
-  // ÚNICO que garantiza que una sala no se reserve dos veces en la misma
-  // franja cuando hay varias réplicas de la API atendiendo en paralelo.
-  // Chequear con un SELECT antes de insertar no alcanza (ver README).
   `CREATE TABLE IF NOT EXISTS reservas (
      id          INT AUTO_INCREMENT PRIMARY KEY,
      sala_id     INT          NOT NULL,
@@ -65,10 +56,6 @@ const ESQUEMA = [
    )`,
 ];
 
-/**
- * MySQL tarda bastante en aceptar conexiones la primera vez que inicializa el
- * datadir. Por eso se reintenta ~60 s antes de fallar.
- */
 async function initDb(reintentos = 15, esperaMs = 4000) {
   for (let intento = 1; intento <= reintentos; intento++) {
     try {
@@ -83,12 +70,6 @@ async function initDb(reintentos = 15, esperaMs = 4000) {
   }
 }
 
-/**
- * Siembra las salas de demo y un par de reservas de hoy. Es idempotente:
- * las salas van con ON DUPLICATE KEY sobre su nombre único y las reservas con
- * INSERT IGNORE sobre sin_solapamiento, así que N réplicas arrancando a la vez
- * dejan siempre el mismo estado.
- */
 async function sembrar() {
   for (const sala of SALAS_DEMO) {
     await pool.query(

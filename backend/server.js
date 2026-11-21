@@ -13,7 +13,6 @@ app.use(express.json({ limit: '64kb' }));
 const NUMEROS_DE_FRANJA = FRANJAS.map((f) => f.numero);
 const ES_FECHA = /^\d{4}-\d{2}-\d{2}$/;
 
-/** Traduce los errores del motor a códigos HTTP con un mensaje entendible. */
 function traducirError(err) {
   switch (err.code) {
     case 'ER_DUP_ENTRY':
@@ -29,7 +28,6 @@ function traducirError(err) {
   }
 }
 
-/** Envuelve un handler async para que un rechazo no tumbe el proceso. */
 const ruta = (handler) => (req, res) => {
   Promise.resolve(handler(req, res)).catch((err) => {
     const traducido = traducirError(err);
@@ -52,8 +50,6 @@ app.get('/health', ruta(async (_req, res) => {
 }));
 
 app.get('/franjas', (_req, res) => res.json(FRANJAS));
-
-// ---------------------------------------------------------------- salas
 
 app.get('/salas', ruta(async (_req, res) => {
   const [filas] = await pool.query(
@@ -84,8 +80,6 @@ app.post('/salas', ruta(async (req, res) => {
 }));
 
 app.delete('/salas/:id', ruta(async (req, res) => {
-  // No hace falta chequear si tiene reservas: la FK con ON DELETE RESTRICT
-  // hace fallar el DELETE y traducirError lo convierte en un 409.
   const [resultado] = await pool.query('DELETE FROM salas WHERE id = ?', [req.params.id]);
   if (resultado.affectedRows === 0) {
     res.status(404).json({ error: 'sala no encontrada' });
@@ -93,8 +87,6 @@ app.delete('/salas/:id', ruta(async (req, res) => {
   }
   res.status(204).end();
 }));
-
-// ------------------------------------------------------------- reservas
 
 app.get('/reservas', ruta(async (req, res) => {
   const { fecha, sala_id: salaId } = req.query;
@@ -146,11 +138,6 @@ app.post('/reservas', ruta(async (req, res) => {
     return;
   }
 
-  // OJO: este SELECT existe solo para dar un mensaje lindo cuando el turno ya
-  // está tomado. NO es lo que garantiza la invariante: entre el SELECT y el
-  // INSERT puede colarse otro pedido (otra réplica, u otro request en la misma
-  // réplica: Node procesa el siguiente mientras este espera al await). Lo que
-  // realmente impide la doble reserva es UNIQUE (sala_id, fecha, franja).
   const [tomadas] = await pool.query(
     'SELECT id FROM reservas WHERE sala_id = ? AND fecha = ? AND franja = ?',
     [Number(salaId), fecha, Number(franja)],

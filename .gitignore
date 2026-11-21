@@ -1,12 +1,10 @@
-# Dependencias de Node
 node_modules/
 
-# Variables de entorno
 .env
 
-# Artefactos de build del frontend
 dist/
 
-# Sistema
 .DS_Store
 *.swp
+
+k8s/secret-reservas-db.yaml

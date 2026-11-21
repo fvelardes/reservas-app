@@ -1,4 +1,3 @@
-# ClusterIP: la base solo la alcanza la API, desde adentro del clúster.
 apiVersion: v1
 kind: Service
 metadata:

@@ -13,13 +13,9 @@ import GrillaReservas from "./components/GrillaReservas.jsx";
 import ReservaModal from "./components/ReservaModal.jsx";
 import SalasModal from "./components/SalasModal.jsx";
 
-// Cada cuánto se vuelve a consultar /api/health. 5 s es suficientemente rápido
-// para que un rolling update se vea en vivo en el badge sin recargar la página.
 const INTERVALO_HEALTH_MS = 5000;
 
 const hoyISO = () => {
-  // Fecha local en YYYY-MM-DD. new Date().toISOString() daría la fecha UTC,
-  // que de noche en Argentina ya es el día siguiente.
   const ahora = new Date();
   const local = new Date(ahora.getTime() - ahora.getTimezoneOffset() * 60000);
   return local.toISOString().slice(0, 10);
@@ -33,7 +29,7 @@ export default function App() {
   const [health, setHealth] = useState(null);
   const [error, setError] = useState(null);
   const [cargando, setCargando] = useState(true);
-  const [reservando, setReservando] = useState(null); // null | {sala, franja}
+  const [reservando, setReservando] = useState(null);
   const [gestionandoSalas, setGestionandoSalas] = useState(false);
 
   const refrescar = useCallback(async () => {
@@ -66,8 +62,6 @@ export default function App() {
   }, []);
 
   const reservar = async (datos) => {
-    // No se atrapa el error acá a propósito: el modal lo muestra sin cerrarse,
-    // que es como se ve el 409 cuando alguien ganó de mano el turno.
     await crearReserva(datos);
     setReservando(null);
     await refrescar();
@@ -91,9 +85,6 @@ export default function App() {
       />
 
       <main className="contenedor">
-        {/* El banner de error no reemplaza a la página: el frontend sigue
-            sirviéndose aunque reservas-api esté caída. Es la demostración
-            visual de que son capas separadas. */}
         {error && (
           <div className="alerta" role="alert">
             <strong>No se puede contactar a reservas-api.</strong> {error}

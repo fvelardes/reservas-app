@@ -7,7 +7,6 @@ export default function GrillaReservas({ salas, franjas, reservas, onReservar, o
     );
   }
 
-  // Índice por sala+franja para no recorrer el array en cada celda.
   const porCelda = new Map(reservas.map((r) => [`${r.sala_id}-${r.franja}`, r]));
 
   return (

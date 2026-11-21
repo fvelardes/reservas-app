@@ -1,12 +1,7 @@
-#version ingenua del dockerfile
-
 FROM node:20-slim AS deps
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
-
-
-#Etapa 2
 
 FROM node:20-slim
 WORKDIR /app

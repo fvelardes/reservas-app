@@ -32,8 +32,6 @@ body {
   padding: 0 1.25rem;
 }
 
-/* ---------- Barra superior ---------- */
-
 .navbar {
   background: linear-gradient(180deg, var(--acento), var(--acento-oscuro));
   color: #fff;
@@ -125,8 +123,6 @@ body {
   background: #f7c8c8;
 }
 
-/* ---------- Barra de fecha ---------- */
-
 main.contenedor {
   padding-top: 1.5rem;
   padding-bottom: 3rem;
@@ -160,8 +156,6 @@ main.contenedor {
   color: var(--texto-suave);
   font-size: 0.85rem;
 }
-
-/* ---------- Grilla de turnos ---------- */
 
 .tabla-scroll {
   overflow-x: auto;
@@ -274,8 +268,6 @@ button.libre:hover {
   color: #8c2318;
 }
 
-/* ---------- Botones y avisos ---------- */
-
 button {
   font: inherit;
   font-weight: 600;
@@ -320,8 +312,6 @@ button.peligro {
   text-align: center;
   padding: 2.5rem 0;
 }
-
-/* ---------- Modales ---------- */
 
 .modal-fondo {
   position: fixed;

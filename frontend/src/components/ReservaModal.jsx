@@ -25,8 +25,6 @@ export default function ReservaModal({ fecha, sala, franja, onGuardar, onCerrar 
         motivo: motivo.trim(),
       });
     } catch (err) {
-      // Acá aterriza el 409 de sin_solapamiento cuando alguien reservó el
-      // mismo turno entre que se abrió el modal y se apretó Confirmar.
       setError(err.message);
       setGuardando(false);
     }
