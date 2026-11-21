@@ -1,0 +1,46 @@
+frontend:
+  image:
+    repository: fvelardes/reservas-frontend
+    tag: v1
+  replicas: 2
+  port: 8080
+  nodePort: 30301
+
+api:
+  image:
+    repository: fvelardes/reservas-api
+    tag: v1
+  replicas: 2
+  port: 3000
+  seedDemo: "true"
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+
+db:
+  image:
+    repository: mysql
+    tag: "8.4"
+  port: 3306
+  name: reservasdb
+  storage: 1Gi
+  storageClassName: ""
+  credentials:
+    user: reservas_user
+    password: cambiar_pass
+    rootPassword: cambiar_root_pass
+
+hpa:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 6
+  cpuUtilization: 50
+
+ingress:
+  enabled: true
+  className: nginx
+  host: reservas.local

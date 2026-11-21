@@ -2182,3 +2182,298 @@ kubectl apply -f k8s/deploy-reservas-frontend.yaml
 # 5. Ingress
 kubectl apply -f k8s/ingress-reservas-app.yaml
 ```
+
+########################################
+
+# Semana 08 — HorizontalPodAutoscaler y chart de Helm
+
+La semana 7 dejó once objetos aplicados a mano con `kubectl apply`. En esta etapa se agrega el objeto número doce, el autoescalador `reservas-api-hpa`, y los once manifiestos sueltos pasan a ser un **chart de Helm** (`reservas-app/`) que se instala como una release con historial, actualización y reversión.
+
+Registro completo de comandos y salidas: [`salidas-semana08.md`](salidas-semana08.md).
+
+Herramientas: `metrics-server` ya corría en `kube-system` (resuelto fuera de clase) y `helm` v4.3.2 se instaló con `brew install helm`.
+
+---
+
+## Consigna 1 — `resources.requests` en `reservas-api`
+
+```yaml
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+```
+
+El HPA no mide "CPU en abstracto": calcula **uso actual / `requests.cpu`** de cada Pod y promedia. Sin `requests` no hay denominador, y la columna `TARGETS` queda en `<unknown>` para siempre aunque `metrics-server` funcione.
+
+- **`100m` de request:** en reposo la API consume 1m, así que el objetivo del 50% equivale a 50m por Pod. Es un valor que la carga de prueba supera con holgura y que el nodo de 2 CPU puede reservar para 6 réplicas (600m).
+- **`500m` de límite:** evita que una réplica bajo carga se quede con todo el nodo y deje sin CPU a MySQL, que comparte la máquina.
+- La memoria no participa del escalado, pero se declara para que el scheduler sepa cuánto reserva cada réplica.
+
+Cambio en `k8s/deploy-reservas-api.yaml`, aplicado con `kubectl apply` y verificado con `kubectl get deploy reservas-api -o jsonpath='{...resources}'`.
+
+## Consigna 2 — `reservas-api-hpa`
+
+`k8s/hpa-reservas-api.yaml` (`autoscaling/v2`): `minReplicas: 2`, `maxReplicas: 6`, objetivo `averageUtilization: 50` sobre CPU.
+
+```
+NAME               REFERENCE                 TARGETS       MINPODS   MAXPODS   REPLICAS   AGE
+reservas-api-hpa   Deployment/reservas-api   cpu: 1%/50%   2         6         2          49s
+```
+
+`TARGETS` muestra un número (`1%`) y no `<unknown>`: hay métricas y hay `requests`.
+
+### ¿Por qué un solo autoescalador entre doce objetos?
+
+- **`reservas-api`** es el único componente **sin estado** cuyo consumo crece con los pedidos: cualquier réplica atiende cualquier pedido y los datos viven en MySQL. Es el candidato natural.
+- **`reservas-db` no puede escalar horizontalmente:** con más réplicas habría varios MySQL independientes sobre un PVC `ReadWriteOnce`, cada uno con su propio índice `UNIQUE`, y se perdería la garantía contra la doble reserva (ver semana 6, consigna 8). Además usa estrategia `Recreate` justamente para que nunca haya dos Pods sobre el mismo datadir.
+- **`reservas-frontend`** sirve archivos estáticos y hace de proxy: consume ~1m de CPU incluso durante la prueba de carga, así que un HPA no tendría nada que medir. Con 2 réplicas fijas alcanza.
+- El resto (Services, ConfigMaps, Secret, PVC, Ingress) no son cargas de trabajo: no tienen réplicas que escalar.
+
+## Consigna 3 — Carga real
+
+Se lanzaron directamente **cuatro** Pods de carga (`carga-1` a `carga-4`, sin `--rm -it`), cada uno pidiendo `GET /reservas` (el listado con `JOIN` entre `reservas` y `salas`) en un bucle:
+
+```bash
+for i in 1 2 3 4; do
+  kubectl run carga-$i --image=busybox --restart=Never -n reservas-app -- \
+    /bin/sh -c "while true; do wget -q -O- http://reservas-api:3000/reservas >/dev/null; done"
+done
+```
+
+Salida de `kubectl get hpa -w` (con la hora local antepuesta). Los Pods de carga se crearon a las 23:44:35 y se borraron a las 23:46:14:
+
+```
+23:44:55  reservas-api-hpa   Deployment/reservas-api   cpu: 9%/50%     2   6   2
+23:45:11  reservas-api-hpa   Deployment/reservas-api   cpu: 349%/50%   2   6   2
+23:45:26  reservas-api-hpa   Deployment/reservas-api   cpu: 300%/50%   2   6   4
+23:45:41  reservas-api-hpa   Deployment/reservas-api   cpu: 167%/50%   2   6   6
+23:46:11  reservas-api-hpa   Deployment/reservas-api   cpu: 118%/50%   2   6   6
+23:46:57  reservas-api-hpa   Deployment/reservas-api   cpu: 101%/50%   2   6   6
+23:47:12  reservas-api-hpa   Deployment/reservas-api   cpu: 20%/50%    2   6   6
+23:47:27  reservas-api-hpa   Deployment/reservas-api   cpu: 0%/50%     2   6   6
+23:51:57  reservas-api-hpa   Deployment/reservas-api   cpu: 0%/50%     2   6   6
+23:52:12  reservas-api-hpa   Deployment/reservas-api   cpu: 0%/50%     2   6   3
+23:52:27  reservas-api-hpa   Deployment/reservas-api   cpu: 1%/50%     2   6   2
+```
+
+En paralelo, `kubectl top pods` confirmó que el consumo efectivamente subía (entre 104m y 143m por réplica con 6 réplicas, y 161m en MySQL), así que el escalado responde a carga real y no a un artefacto.
+
+### Lectura
+
+- **Subida rápida:** 349% significa 349m promedio contra un request de 100m. El HPA calcula `réplicas deseadas = ceil(2 × 349 / 50) = 14`, pero el comportamiento por defecto limita cada paso (como máximo duplica o suma 4 Pods cada 15 s) y el tope es `maxReplicas: 6`. Por eso pasó 2 → 4 → 6 en 30 segundos.
+- **Con 6 réplicas el promedio siguió en ~100%**, por encima del objetivo: el nodo tiene 2 CPU y los propios Pods de carga consumían ~600m. El HPA ya estaba en el máximo; para bajar del 50% haría falta más nodo, no más réplicas.
+- **Bajada lenta, a propósito:** la CPU cayó a 0% a las 23:47:27, pero las réplicas se mantuvieron en 6 hasta las 23:52:12. Es la **ventana de estabilización de bajada (300 s por defecto)**: el HPA toma la recomendación más alta de los últimos 5 minutos para no deshacer réplicas ante un valle momentáneo y volver a crearlas segundos después. Concluir que "no baja" antes de esos 5 minutos sería un error de método.
+
+## Consigna 4 — El chart `reservas-app/`
+
+```
+reservas-app/
+├── Chart.yaml
+├── values.yaml
+├── .helmignore
+└── templates/
+    ├── _helpers.tpl
+    ├── configmap-api.yaml        ConfigMap   reservas-api-config
+    ├── configmap-frontend.yaml   ConfigMap   reservas-frontend-config
+    ├── secret-db.yaml            Secret      reservas-db-secret
+    ├── pvc-db.yaml               PVC         reservas-db-pvc
+    ├── service-db.yaml           Service     reservas-db (ClusterIP)
+    ├── service-api.yaml          Service     reservas-api (ClusterIP)
+    ├── service-frontend.yaml     Service     reservas-frontend (NodePort 30301)
+    ├── deployment-db.yaml        Deployment  reservas-db
+    ├── deployment-api.yaml       Deployment  reservas-api
+    ├── deployment-frontend.yaml  Deployment  reservas-frontend
+    ├── hpa-api.yaml              HPA         reservas-api-hpa
+    └── ingress.yaml              Ingress     reservas-app-ingress
+```
+
+Doce objetos exactos. `reservas-api-nodeport` (el Service de depuración de la semana 6) **no** está en el chart.
+
+Decisiones de diseño:
+
+- **Nombres fijos, no derivados de `.Release.Name`.** Los Deployments referencian `reservas-api-config`, `reservas-frontend-config` y `reservas-db-secret` por nombre, y el frontend resuelve `reservas-api` por DNS. Si los nombres dependieran de la release, un `helm install otro-nombre` generaría objetos que no coinciden con esas referencias (`CreateContainerConfigError`) o un upstream inexistente en nginx. La consigna además pide esos nombres exactos.
+- **`namespace: {{ .Release.Namespace }}`** en todos los templates: el namespace lo decide `helm install -n`, no el chart.
+- **Etiquetas comunes** (`app.kubernetes.io/managed-by`, `instance`, `part-of`, `helm.sh/chart`) en un helper. Los selectores siguen siendo `app: <nombre>`, igual que en las semanas 6 y 7.
+- **Anotaciones `checksum/config` y `checksum/secret`** en la plantilla de los Pods: si cambia un ConfigMap o el Secret, cambia el hash, cambia la plantilla y el Deployment hace un rolling update. Sin esto, un `helm upgrade` que solo toca configuración actualizaría el ConfigMap, pero los Pods seguirían con las variables de entorno viejas.
+- **El Secret sin contraseñas reales en el repositorio.** `values.yaml` trae los mismos valores de ejemplo que `k8s/secret-reservas-db.example.yaml`. Las credenciales reales van en `reservas-app/values-secret.yaml`, que está en `.gitignore` y en `.helmignore`, y se pasan con `-f` en cada install y upgrade.
+
+## Consigna 5 — Qué quedó configurable (`values.yaml`)
+
+| Valor | Default | Dónde impacta |
+|---|---|---|
+| `api.image.repository` / `api.image.tag` | `fvelardes/reservas-api` / `v1` | imagen del Deployment `reservas-api` |
+| `frontend.image.repository` / `frontend.image.tag` | `fvelardes/reservas-frontend` / `v1` | imagen del Deployment `reservas-frontend` |
+| `frontend.replicas` | `2` | `spec.replicas` del frontend |
+| `api.replicas` | `2` | `spec.replicas` de la API **solo con `hpa.enabled=false`** |
+| `hpa.enabled` / `minReplicas` / `maxReplicas` / `cpuUtilization` | `true` / `2` / `6` / `50` | el objeto HPA |
+| `api.resources` | requests 100m/128Mi, limits 500m/256Mi | `resources` de la API (el denominador del HPA) |
+| `api.port` | `3000` | `PORT` y `API_PORT` en los dos ConfigMaps, `containerPort` y Service de la API |
+| `api.seedDemo` | `"true"` | `SEED_DEMO` en `reservas-api-config` |
+| `frontend.port` / `frontend.nodePort` | `8080` / `30301` | Service del frontend y backend del Ingress |
+| `db.image.*`, `db.name`, `db.port`, `db.storage`, `db.storageClassName` | `mysql:8.4`, `reservasdb`, `3306`, `1Gi`, vacío (default del clúster) | Deployment de la base, ConfigMap y PVC |
+| `db.credentials.*` | valores de ejemplo | Secret `reservas-db-secret` |
+| `ingress.enabled` / `className` / `host` | `true` / `nginx` / `reservas.local` | el objeto Ingress |
+
+### Verificación de que ningún parámetro es decorativo
+
+Para cada valor se comparó el render por defecto contra el render con `--set`, con `diff` (salidas completas en `salidas-semana08.md`):
+
+| `--set` | Cambio visible en el manifiesto |
+|---|---|
+| `api.image.tag=v2` | `image: "fvelardes/reservas-api:v1"` → `v2` |
+| `frontend.image.tag=v2` | `image: "fvelardes/reservas-frontend:v1"` → `v2` |
+| `frontend.replicas=3` | `replicas: 2` → `3` |
+| `hpa.minReplicas=3,hpa.maxReplicas=8,hpa.cpuUtilization=70` | `minReplicas`, `maxReplicas` y `averageUtilization` cambian |
+| `ingress.host=reservas.example` | `host: reservas.local` → `reservas.example` |
+| `hpa.enabled=false,ingress.enabled=false` | se generan 10 objetos en lugar de 12 |
+| **`api.replicas=4`** | **ningún cambio** (`diff` vacío) |
+| `hpa.enabled=false,api.replicas=4` | desaparece el HPA y aparece `replicas: 4` |
+
+`api.replicas` es el único valor que, con la configuración por defecto, **no produce cambio**, y es intencional. Con el HPA activo, el template **omite** `spec.replicas` en el Deployment de la API: las réplicas pasan a ser del HPA. Si el chart fijara `replicas: 2`, cada `helm upgrade` devolvería la API a 2 réplicas en medio de un pico de carga, pisando la decisión del autoescalador. El valor solo tiene efecto cuando se desactiva el HPA, y así está documentado en la tabla.
+
+## Consigna 6 — Render, instalación y verificación
+
+`helm lint reservas-app` sin errores, y `helm template` genera **12** objetos:
+
+```
+kind: ConfigMap   reservas-api-config         kind: Ingress                  reservas-app-ingress
+kind: ConfigMap   reservas-frontend-config    kind: PersistentVolumeClaim    reservas-db-pvc
+kind: Deployment  reservas-api                kind: Secret                   reservas-db-secret
+kind: Deployment  reservas-db                 kind: Service                  reservas-api
+kind: Deployment  reservas-frontend           kind: Service                  reservas-db
+kind: HorizontalPodAutoscaler reservas-api-hpa kind: Service                 reservas-frontend
+```
+
+### Limpieza previa
+
+El namespace `reservas-app` tenía los objetos de las semanas 5 a 7 con los mismos nombres, creados con `kubectl apply`. Helm se niega a instalar sobre objetos que no le pertenecen (no tienen la anotación `meta.helm.sh/release-name`), así que primero se borró el namespace completo:
+
+```bash
+kubectl delete namespace reservas-app
+helm install reservas-app ./reservas-app -n reservas-app --create-namespace \
+  -f reservas-app/values-secret.yaml --wait --timeout 5m
+```
+
+Consecuencia asumida: el PV `local-path` se borra con su PVC, así que las reservas cargadas en la semana 7 se perdieron. La API vuelve a sembrar las 5 salas de demo (`SEED_DEMO=true`). El NodePort de depuración `30501` también desapareció, como corresponde.
+
+```
+NAME          NAMESPACE     REVISION  STATUS    CHART               APP VERSION
+reservas-app  reservas-app  1         deployed  reservas-app-0.1.0  v1
+```
+
+`kubectl get all,cm,secret,pvc,ingress,hpa -n reservas-app` muestra los 3 Deployments, los 3 Services, los 2 ConfigMaps, `reservas-db-secret`, el PVC `Bound`, el Ingress con `ADDRESS 172.16.21.227` y el HPA con `cpu: 2%/50%`. Aparece además `sh.helm.release.v1.reservas-app.v1`: es el Secret donde Helm guarda la revisión, no un objeto de la aplicación.
+
+### El orden de instalación por tipo, y lo que no resuelve
+
+`helm template` (y `helm install`) emiten los objetos en un orden fijo por tipo: **Secret → ConfigMap → PVC → Service → Deployment → HPA → Ingress**. Es el mismo orden que en la semana 7 había que respetar a mano: los Pods nacen cuando sus ConfigMaps, su Secret, su volumen y los nombres DNS ya existen, así que no hay `CreateContainerConfigError` ni `host not found in upstream` en el frontend.
+
+Lo que ese orden **no** resuelve es la disponibilidad. Helm crea los tres Deployments casi a la vez y no espera a que MySQL esté listo para aceptar conexiones. Con un PVC vacío, MySQL tarda más de un minuto en inicializar el datadir; la API agotó sus 15 reintentos (`connect ECONNREFUSED 10.105.234.180:3306`), terminó, Kubernetes la reinició (`RESTARTS 1`) y en el segundo arranque encontró la base lista. Durante ese intervalo el Ingress devolvía `502 Bad Gateway` (registrado en `salidas-semana08.md`). Helm ordena la **creación**; la espera entre componentes la siguen resolviendo los reintentos de la API y la política de reinicio de Kubernetes.
+
+## Consigna 7 — Ciclo de vida de la release
+
+### Antes: revisión 1, API v1
+
+![Badge API v1 antes del upgrade](docs/capturas/semana08-v1-antes.png)
+
+### `helm upgrade` con la API en v2
+
+```bash
+helm upgrade reservas-app ./reservas-app -n reservas-app \
+  -f reservas-app/values-secret.yaml --set api.image.tag=v2 --wait --timeout 5m
+```
+
+```
+NAME                IMAGE
+reservas-api        fvelardes/reservas-api:v2
+reservas-db         mysql:8.4
+reservas-frontend   fvelardes/reservas-frontend:v1
+```
+
+![Badge API v2 después del upgrade](docs/capturas/semana08-v2-upgrade.png)
+
+- **Hay que repetir `-f reservas-app/values-secret.yaml`.** `helm upgrade` no hereda los valores pasados en el install: sin el archivo, el Secret volvería a las contraseñas de ejemplo de `values.yaml`, el checksum cambiaría y los Pods se reiniciarían con credenciales que MySQL no reconoce. La alternativa es `--reuse-values`.
+- **Solo se reemplazaron los Pods de la API.** La base y el frontend conservaron sus Pods (`AGE 15h`), porque su plantilla no cambió.
+- **Modificar el tag de la API no modifica el del frontend.** Son dos imágenes con ciclos de vida independientes: el frontend sigue en `reservas-frontend:v1` y el badge muestra la versión que **informa la API** en `/api/health` (horneada con `ARG APP_VERSION` en su Dockerfile, semana 2), no la del frontend.
+- Justo después del upgrade, un `curl` todavía respondió `v1`: los Pods viejos estaban en `Terminating` y seguían atendiendo hasta salir de los Endpoints. Unos segundos después, cinco pedidos seguidos respondieron `v2`.
+
+### `helm history` y `helm rollback`
+
+```bash
+helm rollback reservas-app 1 -n reservas-app --wait --timeout 5m
+helm history reservas-app -n reservas-app
+```
+
+```
+REVISION  UPDATED                   STATUS      CHART               APP VERSION  DESCRIPTION
+1         Fri Nov 20 23:54:56 2026  superseded  reservas-app-0.1.0  v1           Install complete
+2         Sat Nov 21 15:53:37 2026  superseded  reservas-app-0.1.0  v1           Upgrade complete
+3         Sat Nov 21 15:56:30 2026  deployed    reservas-app-0.1.0  v1           Rollback to 1
+```
+
+- **El rollback no borra historia: crea la revisión 3**, con el contenido de la 1. Por eso se puede volver a hacer rollback a la 2 si hiciera falta.
+- La columna `APP VERSION` dice `v1` en las tres revisiones porque sale de `appVersion` en `Chart.yaml`, que no cambió. La versión que realmente corre la dicen la imagen del Deployment y el badge.
+- Después del rollback, `reservas-api` volvió a `fvelardes/reservas-api:v1` y reutilizó el ReplicaSet original (`reservas-api-76cfd9c6c6`), igual que el `rollout undo` de la semana 6.
+- El HPA mostró `<unknown>` durante unos segundos tras el rollback: los Pods nuevos todavía no tenían una muestra de `metrics-server`. Quince segundos después volvió a `cpu: 1%/50%`.
+
+### Después: revisión 3, API v1
+
+![Badge API v1 después del rollback](docs/capturas/semana08-v1-rollback.png)
+
+---
+
+## De una réplica de la API a tres: qué deja de estar garantizado
+
+Con el HPA, la API ya no es una réplica: son entre 2 y 6 procesos independientes, que pueden aparecer y desaparecer en cualquier momento.
+
+- **Deja de estar garantizado** que la verificación previa de `POST /reservas` (el `SELECT` "¿está libre?" seguido del `INSERT`) proteja contra la doble reserva. Es un patrón *check-then-act*: con varias réplicas, dos pedidos pueden leer "libre" a la vez en procesos distintos y avanzar los dos al `INSERT`. Ya con una réplica era frágil, porque Node intercala pedidos en cada `await`; con varias, la carrera es la norma.
+- **Lo que sí sigue garantizado** es la invariante, porque no vive en la API sino en la base: `CONSTRAINT sin_solapamiento UNIQUE (sala_id, fecha, franja)`. MySQL es un único punto que verifica ese índice de forma atómica; el primer `INSERT` gana y los demás reciben `ER_DUP_ENTRY`, que la API traduce a `409`. La prueba de concurrencia de la semana 6 (30 pedidos simultáneos con 3 réplicas: 1 × `201`, 29 × `409`, 1 fila) lo demuestra.
+- **Por eso el HPA va sobre la API y nunca sobre la base:** la garantía depende de que haya **un solo** MySQL con **un solo** índice.
+- Otras cosas que dejan de ser únicas con varias réplicas: el sembrado inicial corre en cada réplica a la vez (los huecos en los `id` de `salas` vistos en la semana 6 vienen de ahí, y el `UNIQUE (nombre)` evita los duplicados) y cada réplica tiene su propio pool de conexiones, así que el total de conexiones a MySQL crece con `maxReplicas`.
+
+---
+
+## Inventario final: doce objetos
+
+| Nombre | Tipo | Template |
+|---|---|---|
+| `reservas-frontend` | Deployment | `deployment-frontend.yaml` |
+| `reservas-api` | Deployment | `deployment-api.yaml` |
+| `reservas-db` | Deployment | `deployment-db.yaml` |
+| `reservas-frontend` | Service NodePort (30301) | `service-frontend.yaml` |
+| `reservas-api` | Service ClusterIP | `service-api.yaml` |
+| `reservas-db` | Service ClusterIP | `service-db.yaml` |
+| `reservas-frontend-config` | ConfigMap | `configmap-frontend.yaml` |
+| `reservas-api-config` | ConfigMap | `configmap-api.yaml` |
+| `reservas-db-secret` | Secret | `secret-db.yaml` |
+| `reservas-db-pvc` | PersistentVolumeClaim | `pvc-db.yaml` |
+| `reservas-app-ingress` | Ingress (`reservas.local` → `reservas-frontend:8080`) | `ingress.yaml` |
+| `reservas-api-hpa` | HorizontalPodAutoscaler | `hpa-api.yaml` |
+
+## Archivos nuevos o modificados
+
+| Archivo | Estado | Contenido |
+|---|---|---|
+| `k8s/deploy-reservas-api.yaml` | modificado | `resources.requests` y `limits` |
+| `k8s/hpa-reservas-api.yaml` | nuevo | HPA aplicado a mano en las consignas 2 y 3 |
+| `reservas-app/` | nuevo | chart de Helm con los 12 objetos |
+| `reservas-app/values-secret.yaml` | nuevo, **no versionado** | credenciales reales de MySQL (en `.gitignore`) |
+| `salidas-semana08.md` | nuevo | registro de comandos y salidas |
+| `docs/capturas/semana08-*.png` | nuevo | badge de versión antes del upgrade, después del upgrade y después del rollback |
+
+### Cómo instalar desde cero
+
+```bash
+cat > reservas-app/values-secret.yaml <<'YAML'
+db:
+  credentials:
+    user: "<usuario>"
+    password: "<contraseña>"
+    rootPassword: "<contraseña de root>"
+YAML
+helm template reservas-app ./reservas-app -n reservas-app -f reservas-app/values-secret.yaml | grep -c '^kind:'
+helm install reservas-app ./reservas-app -n reservas-app --create-namespace -f reservas-app/values-secret.yaml
+```

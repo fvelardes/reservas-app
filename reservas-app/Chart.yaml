@@ -1,0 +1,6 @@
+apiVersion: v2
+name: reservas-app
+description: Reserva de salas por franja horaria (React + Vite, Node 20 + Express, MySQL 8.4)
+type: application
+version: 0.1.0
+appVersion: "v1"

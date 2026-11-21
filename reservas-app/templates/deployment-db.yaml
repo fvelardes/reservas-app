@@ -1,0 +1,43 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: reservas-db
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "reservas-app.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: reservas-db
+  template:
+    metadata:
+      labels:
+        app: reservas-db
+      annotations:
+        checksum/secret: {{ include (print $.Template.BasePath "/secret-db.yaml") . | sha256sum }}
+    spec:
+      containers:
+        - name: reservas-db
+          image: "{{ .Values.db.image.repository }}:{{ .Values.db.image.tag }}"
+          ports:
+            - containerPort: 3306
+          envFrom:
+            - secretRef:
+                name: reservas-db-secret
+          env:
+            - name: MYSQL_DATABASE
+              valueFrom:
+                configMapKeyRef:
+                  name: reservas-api-config
+                  key: DB_NAME
+          volumeMounts:
+            - name: datos
+              mountPath: /var/lib/mysql
+              subPath: mysql
+      volumes:
+        - name: datos
+          persistentVolumeClaim:
+            claimName: reservas-db-pvc
